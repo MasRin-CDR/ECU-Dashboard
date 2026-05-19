@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <math.h>
 
 // ============================================================================
 // Configuration constants
@@ -22,6 +23,7 @@ constexpr uint32_t PAGE_SWITCH_MS  = 4500;
 constexpr uint32_t FULL_REDRAW_MS  = 5000;
 constexpr uint32_t WDT_TIMEOUT_MS  = 8000;
 constexpr uint32_t ECU_EXT_TIMEOUT_MS = 2000;
+constexpr uint32_t ECU_RECONNECT_DELAY_MS = 8000;
 
 constexpr uint32_t RPM_MIN_EDGE_US   = 650;
 constexpr uint32_t SPEED_MIN_EDGE_US = 2500;
@@ -37,6 +39,7 @@ constexpr uint32_t KLINE_FAST_HIGH_MS       = 25;
 constexpr uint32_t KLINE_5BAUD_BIT_MS       = 200;
 constexpr uint32_t KLINE_W4_MS              = 300;
 constexpr uint32_t KLINE_STARTCOMM_TMO_MS   = 2000;
+constexpr uint32_t KLINE_INTER_BYTE_MS      = 10;
 
 constexpr uint32_t SCAN_PHASE_TMO_MS  = 3000;
 constexpr uint32_t SCAN_TOTAL_TMO_MS  = 30000;
@@ -63,9 +66,9 @@ constexpr float BATT_R1_OHM        = 100000.0f;
 constexpr float BATT_R2_OHM        = 22000.0f;
 constexpr float BATT_DIVIDER_RATIO = (BATT_R1_OHM + BATT_R2_OHM) / BATT_R2_OHM;
 constexpr float AFR_DIVIDER_RATIO  = 2.447f;
-constexpr float AFR_SENSOR_V_MIN   = 0.50f;
-constexpr float AFR_SENSOR_V_MAX   = 4.50f;
-constexpr float AFR_MIN_VALUE      = 10.0f;
+constexpr float AFR_SENSOR_V_MIN   = 0.05f;
+constexpr float AFR_SENSOR_V_MAX   = 1.00f;
+constexpr float AFR_MIN_VALUE      = 12.2f;
 constexpr float AFR_MAX_VALUE      = 20.0f;
 constexpr float TEMP_NTC_FIXED_OHM = 10000.0f;
 constexpr float TEMP_NTC_R25_OHM   = 10000.0f;
@@ -156,7 +159,7 @@ enum class BrandId : uint8_t {
 enum class ScanPhase : uint8_t {
   Idle=0, CanBus125k, CanBus250k, CanBus500k, CanBus1M,
   KLineFastHonda, KLineFastYamaha, KLineFastKawasaki,
-  KLine5BaudHonda, KLine5BaudYamaha, KLine5BaudSuzuki,
+  KLine5BaudHonda, KLine5BaudYamaha, KLine5BaudYamahaAlt, KLine5BaudSuzuki,
   Done, Failed
 };
 
@@ -331,12 +334,13 @@ static const char* scanPhaseText(ScanPhase p) {
     case ScanPhase::CanBus250k:      return "CAN 250k";
     case ScanPhase::CanBus500k:      return "CAN 500k";
     case ScanPhase::CanBus1M:        return "CAN 1M";
-    case ScanPhase::KLineFastHonda:  return "K-LINE FAST → HONDA (0x6A)";
-    case ScanPhase::KLineFastYamaha: return "K-LINE FAST → YAMAHA (0x85)";
-    case ScanPhase::KLineFastKawasaki:return "K-LINE FAST → KAWASAKI (0x84)";
-    case ScanPhase::KLine5BaudHonda: return "K-LINE 5BAUD → HONDA (0x6A)";
-    case ScanPhase::KLine5BaudYamaha:return "K-LINE 5BAUD → YAMAHA (0x85)";
-    case ScanPhase::KLine5BaudSuzuki:return "K-LINE 5BAUD → SUZUKI (0x6B)";
+    case ScanPhase::KLineFastHonda:  return "K-LINE FAST -> HONDA (0x6A)";
+    case ScanPhase::KLineFastYamaha: return "K-LINE FAST -> YAMAHA (0x85)";
+    case ScanPhase::KLineFastKawasaki:return "K-LINE FAST -> KAWASAKI (0x84)";
+    case ScanPhase::KLine5BaudHonda: return "K-LINE 5BAUD -> HONDA (0x6A)";
+    case ScanPhase::KLine5BaudYamaha:return "K-LINE 5BAUD -> YAMAHA (0x85)";
+    case ScanPhase::KLine5BaudYamahaAlt:return "K-LINE 5BAUD -> YAMAHA ALT (0x17)";
+    case ScanPhase::KLine5BaudSuzuki:return "K-LINE 5BAUD -> SUZUKI (0x6B)";
     case ScanPhase::Done:            return "DETECTED";
     case ScanPhase::Failed:          return "NOT FOUND";
     default:                         return "IDLE";
@@ -357,6 +361,38 @@ static void formatSensorValueSimple(SensorId id, const SensorSample& s, char* ou
       else snprintf(out, sz, "%.1f %s", s.filtered, unit);
       break;
   }
+}
+
+struct AfrLookupPoint {
+  float voltage;
+  float afr;
+};
+
+static constexpr AfrLookupPoint NARROWBAND_AFR_TABLE[] = {
+  { 0.05f, 20.0f },
+  { 0.10f, 18.5f },
+  { 0.20f, 16.2f },
+  { 0.30f, 15.3f },
+  { 0.45f, 14.7f },
+  { 0.60f, 14.2f },
+  { 0.75f, 13.5f },
+  { 0.90f, 12.8f },
+  { 1.00f, 12.2f },
+};
+
+static float afrFromNarrowbandVoltage(float voltage) {
+  constexpr size_t count = sizeof(NARROWBAND_AFR_TABLE) / sizeof(NARROWBAND_AFR_TABLE[0]);
+  if (voltage <= NARROWBAND_AFR_TABLE[0].voltage) return NARROWBAND_AFR_TABLE[0].afr;
+  for (size_t i = 1; i < count; ++i) {
+    const AfrLookupPoint& lo = NARROWBAND_AFR_TABLE[i - 1];
+    const AfrLookupPoint& hi = NARROWBAND_AFR_TABLE[i];
+    if (voltage <= hi.voltage) {
+      const float span = hi.voltage - lo.voltage;
+      const float t = span > 0.0f ? (voltage - lo.voltage) / span : 0.0f;
+      return lo.afr + (hi.afr - lo.afr) * t;
+    }
+  }
+  return NARROWBAND_AFR_TABLE[count - 1].afr;
 }
 
 struct PidSlot {
@@ -530,6 +566,7 @@ static const ScanCandidate SCAN_CANDIDATES[] = {
   { ScanPhase::KLineFastKawasaki, &PROFILE_KAWASAKI },
   { ScanPhase::KLineFastYamaha,   &PROFILE_YAMAHA   },
   { ScanPhase::KLine5BaudYamaha,  &PROFILE_YAMAHA   },
+  { ScanPhase::KLine5BaudYamahaAlt, &PROFILE_YAMAHA_ALT },
   { ScanPhase::KLine5BaudSuzuki,  &PROFILE_SUZUKI   },
   { ScanPhase::KLine5BaudHonda,   &PROFILE_HONDA    },
   { ScanPhase::CanBus125k,        &PROFILE_GENERIC  },
@@ -550,6 +587,19 @@ static const BrandProfile* profileForBrand(BrandId id) {
     case BrandId::KTM:       return &PROFILE_KTM;
     default:                 return &PROFILE_GENERIC;
   }
+}
+
+static const BrandProfile* profileForScanResult(const ScanResult& result) {
+  for (size_t i = 0; i < SCAN_CANDIDATE_COUNT; ++i) {
+    const BrandProfile* profile = SCAN_CANDIDATES[i].profile;
+    if (!profile) continue;
+    if (profile->brandId == result.brand &&
+        profile->ecuAddress == result.ecuAddress &&
+        profile->initMethod == result.initMethod) {
+      return profile;
+    }
+  }
+  return profileForBrand(result.brand);
 }
 
 // ============================================================================
@@ -618,7 +668,7 @@ public:
     while (serial.available()) serial.read();
     for (uint8_t i = 0; i < profile.startCommLen; ++i) {
       serial.write(profile.startCommBytes[i]);
-      delay(KLINE_INTER_BYTE_MS);
+      delay(cfg::KLINE_INTER_BYTE_MS);
     }
     return waitForAck(serial, profile, cfg::KLINE_STARTCOMM_TMO_MS);
   }
@@ -650,7 +700,7 @@ public:
     while (serial.available()) serial.read();
     for (uint8_t i = 0; i < profile.startCommLen; ++i) {
       serial.write(profile.startCommBytes[i]);
-      delay(KLINE_INTER_BYTE_MS);
+      delay(cfg::KLINE_INTER_BYTE_MS);
     }
     return waitForAck(serial, profile, cfg::KLINE_STARTCOMM_TMO_MS);
   }
@@ -690,7 +740,6 @@ private:
     }
     return false;
   }
-  static constexpr uint32_t KLINE_INTER_BYTE_MS = 10;
 };
 
 class KLineManager {
@@ -698,7 +747,8 @@ public:
   KLineManager()
     : _serial(Serial2), _state(EcuState::Disabled),
       _protocol(ProtocolType::Unknown), _enabled(false), _connected(false),
-      _requestPending(false), _lastRxMs(0), _lastRetryMs(0),
+      _requestPending(false), _rxPin(-1), _txPin(-1),
+      _baud(cfg::KLINE_BAUD), _lastRxMs(0), _lastRetryMs(0),
       _lastRequestMs(0), _errorCount(0), _rxLen(0), _haveFrame(false) {}
 
   bool begin(int16_t rxPin, int16_t txPin, uint32_t baud) {
@@ -888,7 +938,7 @@ public:
         _kline->reinit(_kline->rxPin(), _kline->txPin(), cfg::KLINE_BAUD);
         snprintf(_statusMsg, sizeof(_statusMsg), "%s  NO RESPONSE", _currentDesc);
         if (cfg::DEBUG_MODE)
-          Serial.printf("[SCAN] %s — no response\n", _currentDesc);
+          Serial.printf("[SCAN] %s - no response\n", _currentDesc);
         _candidateIdx++;
         _phaseStart = 0;
       }
@@ -926,12 +976,12 @@ private:
     _result.baudRate       = cand.profile->baudRate;
     _result.pidsFound      = cand.profile->pidCount;
     _result.scanDurationMs = millis() - _scanStart;
-    strncpy(_result.brandName, brandText(cand.profile->brandId), sizeof(_result.brandName)-1);
+    strncpy(_result.brandName, cand.profile->name, sizeof(_result.brandName)-1);
     const char* pname = (proto == ProtocolType::KWP2000_FastInit) ? "KWP2000 Fast Init" : "ISO 9141-2 5-Baud";
     strncpy(_result.protoName, pname, sizeof(_result.protoName)-1);
     snprintf(_statusMsg, sizeof(_statusMsg), "DETECTED: %s %s", _result.brandName, _result.protoName);
     if (cfg::DEBUG_MODE)
-      Serial.printf("[SCAN] ✓ %s via %s addr=0x%02X in %lums\n",
+      Serial.printf("[SCAN] OK %s via %s addr=0x%02X in %lums\n",
                     _result.brandName, _result.protoName,
                     _result.ecuAddress, (unsigned long)_result.scanDurationMs);
   }
@@ -941,8 +991,8 @@ private:
     _phase = ScanPhase::Failed;
     _result.detected = false;
     _result.scanDurationMs = millis() - _scanStart;
-    snprintf(_statusMsg, sizeof(_statusMsg), "ECU NOT FOUND — check connector & ignition");
-    if (cfg::DEBUG_MODE) Serial.println("[SCAN] ✗ No ECU detected");
+    snprintf(_statusMsg, sizeof(_statusMsg), "ECU NOT FOUND - check connector & ignition");
+    if (cfg::DEBUG_MODE) Serial.println("[SCAN] FAIL No ECU detected");
   }
 };
 
@@ -1092,10 +1142,10 @@ private:
     uint16_t raw=AnalogSampler::averageRaw(cfg::PIN_AFR_ADC);
     float sv=AnalogSampler::toVolt(raw)*cfg::AFR_DIVIDER_RATIO;
     r.raw=sv;
-    if(sv<0.2f||sv>5.2f){ r.status=SensorStatus::Error; r.value=_s[idx(SensorId::Afr)].lastGood; return r; }
-    float afr=mapf(sv,cfg::AFR_SENSOR_V_MIN,cfg::AFR_SENSOR_V_MAX,cfg::AFR_MIN_VALUE,cfg::AFR_MAX_VALUE);
+    if(sv<0.0f||sv>1.20f){ r.status=SensorStatus::Error; r.value=_s[idx(SensorId::Afr)].lastGood; return r; }
+    float afr=afrFromNarrowbandVoltage(sv);
     r.value=clamp(afr,8.f,22.f); r.valid=true;
-    r.status=(sv<cfg::AFR_SENSOR_V_MIN+0.12f||sv>cfg::AFR_SENSOR_V_MAX-0.12f)?SensorStatus::Warning:SensorStatus::Ok;
+    r.status=(sv<cfg::AFR_SENSOR_V_MIN||sv>cfg::AFR_SENSOR_V_MAX)?SensorStatus::Warning:SensorStatus::Ok;
     return r;
   }
 
@@ -1270,8 +1320,9 @@ class ECURequestManager {
 public:
   void begin(const BrandProfile* profile, bool enabled) {
     _profile = profile; _enabled = enabled; _cursor = 0; _lastPollMs = 0;
+    resetPollTimers();
   }
-  void setProfile(const BrandProfile* profile) { _profile = profile; _cursor = 0; }
+  void setProfile(const BrandProfile* profile) { _profile = profile; _cursor = 0; resetPollTimers(); }
 
   void update(KLineManager& kline, SensorHub& hub) {
     if (!_enabled || !_profile || !kline.isConnected()) return;
@@ -1302,6 +1353,10 @@ private:
   uint8_t  _cursor               = 0;
   uint32_t _lastPollMs           = 0;
   uint32_t _slotLastMs[cfg::MAX_PIDS] = {};
+
+  void resetPollTimers() {
+    for (size_t i = 0; i < cfg::MAX_PIDS; ++i) _slotLastMs[i] = 0;
+  }
 };
 
 void ECUDataParser::parse(const ECUFrame& frame, SensorHub& hub, BrandId brand) {
@@ -1327,7 +1382,7 @@ void ECUDataParser::parse(const ECUFrame& frame, SensorHub& hub, BrandId brand) 
       case cfg::PID_O2_1:
         if (frame.payloadLen >= 3) {
           float v = frame.payload[2]*0.005f;
-          hub.injectAfr(constrain(14.7f+(v-0.45f)*6.0f, 8.0f, 22.0f));
+          hub.injectAfr(afrFromNarrowbandVoltage(v));
         }
         break;
       case cfg::PID_MAP:
@@ -1357,7 +1412,7 @@ void ECUDataParser::parse(const ECUFrame& frame, SensorHub& hub, BrandId brand) 
       case 0x02: if(frame.payloadLen>=3) hub.injectTps(frame.payload[2]*100.0f/255.0f); break;
       case 0x03: if(frame.payloadLen>=3) hub.injectEngineTemp(frame.payload[2]-40.0f); break;
       case 0x04: if(frame.payloadLen>=3) hub.injectBattery(frame.payload[2]*0.1f); break;
-      case 0x20: if(frame.payloadLen>=3) { float v=frame.payload[2]*0.005f; hub.injectAfr(constrain(14.7f+(v-0.45f)*6.f,8.f,22.f)); } break;
+      case 0x20: if(frame.payloadLen>=3) { float v=frame.payload[2]*0.005f; hub.injectAfr(afrFromNarrowbandVoltage(v)); } break;
       case 0x21: if(frame.payloadLen>=3) hub.injectIat(frame.payload[2]-40.0f); break;
       case 0x30: if(frame.payloadLen>=3) hub.inject(SensorId::InjectorPulse,frame.payload[2]*0.1f,true,SensorSource::Ecu); break;
       default: break;
@@ -1390,8 +1445,13 @@ ECURequestManager requestManager;
 bool scanStarted = false;
 bool scanProcessed = false;
 uint32_t lastPrintMs = 0;
+volatile bool scanButtonPressed = false;
 
 static inline bool pinActive(int16_t p) { return p >= 0; }
+
+void IRAM_ATTR handleScanButton() {
+  scanButtonPressed = true;
+}
 
 void printScanResult(const ScanResult& result) {
   Serial.println("----- ECU SCAN RESULT -----");
@@ -1420,11 +1480,49 @@ void printSnapshot(const DashboardSnapshot& snap) {
   Serial.println("-------------------------------");
 }
 
+void triggerRescan() {
+  scanStarted = true;
+  scanProcessed = false;
+  requestManager.setEnabled(false);
+  sensorHub.setEcuEnabled(false);
+  sensorHub.setEcuOnline(false);
+  klineManager.enable(false);
+  delay(50);
+  klineManager.reinit(cfg::PIN_KLINE_RX, cfg::PIN_KLINE_TX, cfg::KLINE_BAUD);
+  klineManager.enable(true);
+  scanner.begin(klineManager);
+  Serial.println("[SYS] ECU rescan started");
+}
+
+void autoReconnect() {
+  static uint32_t lostSinceMs = 0;
+  const ScanResult result = scanner.result();
+  if (!scanProcessed || !result.detected) {
+    lostSinceMs = 0;
+    return;
+  }
+  if (klineManager.isConnected()) {
+    lostSinceMs = 0;
+    return;
+  }
+  const uint32_t now = millis();
+  if (lostSinceMs == 0) lostSinceMs = now;
+  if ((now - lostSinceMs) >= cfg::ECU_RECONNECT_DELAY_MS) {
+    lostSinceMs = 0;
+    Serial.println("[SYS] ECU offline, restarting scan");
+    triggerRescan();
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(100);
   Serial.println("Universal ECU scanner starting...");
   if (!sensorHub.begin()) Serial.println("[ERROR] SensorHub init failed");
+  if (pinActive(cfg::PIN_SCAN_BUTTON)) {
+    pinMode(static_cast<uint8_t>(cfg::PIN_SCAN_BUTTON), INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(cfg::PIN_SCAN_BUTTON), handleScanButton, FALLING);
+  }
   klineManager.begin(cfg::PIN_KLINE_RX, cfg::PIN_KLINE_TX, cfg::KLINE_BAUD);
   klineManager.enable(true);
   scanStarted = false;
@@ -1437,14 +1535,20 @@ void loop() {
     scanStarted = true;
   }
 
-  klineManager.update();
-  scanner.update();
+  if (scanButtonPressed) {
+    scanButtonPressed = false;
+    triggerRescan();
+  }
 
-  if (scanner.isDone() && !scanProcessed) {
+  klineManager.update();
+  bool scanDone = scanner.isDone();
+  if (!scanDone) scanDone = scanner.update();
+
+  if (scanDone && !scanProcessed) {
     ScanResult result = scanner.result();
     printScanResult(result);
     if (result.detected) {
-      requestManager.begin(profileForBrand(result.brand), true);
+      requestManager.begin(profileForScanResult(result), true);
       sensorHub.setEcuEnabled(true);
       sensorHub.setEcuOnline(true);
     } else {
@@ -1454,11 +1558,13 @@ void loop() {
     scanProcessed = true;
   }
 
-  if (scanner.isDone() && scanner.result().detected) {
+  if (scanProcessed && scanner.result().detected) {
     requestManager.update(klineManager, sensorHub);
   }
 
+  sensorHub.setEcuOnline(klineManager.isConnected());
   sensorHub.update();
+  autoReconnect();
 
   const uint32_t now = millis();
   if ((now - lastPrintMs) >= 1000) {

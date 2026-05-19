@@ -1,5 +1,7 @@
 #include <Arduino.h>
+#include <Preferences.h>
 #include <math.h>
+#include <string.h>
 
 // ============================================================================
 // Configuration constants
@@ -40,6 +42,8 @@ constexpr uint32_t KLINE_5BAUD_BIT_MS       = 200;
 constexpr uint32_t KLINE_W4_MS              = 300;
 constexpr uint32_t KLINE_STARTCOMM_TMO_MS   = 2000;
 constexpr uint32_t KLINE_INTER_BYTE_MS      = 10;
+constexpr uint32_t KLINE_ECHO_WINDOW_MS     = 150;
+constexpr uint32_t RESCAN_REINIT_DELAY_MS   = 60;
 
 constexpr uint32_t SCAN_PHASE_TMO_MS  = 3000;
 constexpr uint32_t SCAN_TOTAL_TMO_MS  = 30000;
@@ -149,8 +153,18 @@ enum class SensorSource  : uint8_t { Hardware=0, Ecu, Estimated, Simulation, Off
 enum class WarningLevel  : uint8_t { None=0, Info, Warning, Critical };
 enum class WarningReason : uint8_t { None=0, EcuTimeout, BatteryLow, Overheat, AfrLean, AfrRich, SensorFault };
 enum class EcuState      : uint8_t { Disabled=0, Idle, Probing, Connected, Requesting, WaitingResponse, Error, Reconnecting };
-enum class ProtocolType  : uint8_t { Unknown=0, ISO9141_5Baud, KWP2000_FastInit, CanBus };
-enum class InitMethod    : uint8_t { None=0, FastInit, FiveBaud };
+enum class MotorModel    : uint8_t {
+  Unknown=0, SensorOnly, HondaVario125Kzr, GenericKLine,
+  YamahaGeneric, YamahaAlt, SuzukiGeneric, KawasakiGeneric,
+  DucatiCan, BmwCan, KtmCan
+};
+enum class ProtocolType  : uint8_t {
+  None=0, HondaKLine, GenericOBD2KLine, CAN,
+  YamahaKLine, SuzukiKLine, KawasakiKLine, Unknown,
+  ISO9141_5Baud, KWP2000_FastInit, CanBus=CAN
+};
+enum class ChecksumMode  : uint8_t { Sum8=0, TwosComplement };
+enum class InitMethod    : uint8_t { None=0, FastInit, FiveBaudInit, FiveBaud=FiveBaudInit };
 
 enum class BrandId : uint8_t {
   Unknown=0, Honda, Yamaha, Suzuki, Kawasaki, Ducati, BMW, KTM, GenericObd2
@@ -158,7 +172,7 @@ enum class BrandId : uint8_t {
 
 enum class ScanPhase : uint8_t {
   Idle=0, CanBus125k, CanBus250k, CanBus500k, CanBus1M,
-  KLineFastHonda, KLineFastYamaha, KLineFastKawasaki,
+  KLineFastHonda, KLineFastYamaha, KLineFastKawasaki, KLineFastGeneric,
   KLine5BaudHonda, KLine5BaudYamaha, KLine5BaudYamahaAlt, KLine5BaudSuzuki,
   Done, Failed
 };
@@ -191,6 +205,8 @@ struct ScanResult {
   uint8_t      ecuAddress     = 0;
   uint32_t     baudRate       = 0;
   uint8_t      pidsFound      = 0;
+  uint8_t      confidence     = 0;
+  char         profileId[24]  = "sensor-only";
   char         brandName[24]  = "UNKNOWN";
   char         protoName[32]  = "---";
   uint32_t     scanDurationMs = 0;
@@ -232,6 +248,8 @@ struct DashboardSnapshot {
   float        fuelInstantKmL   = 0.0f;
   float        fuelAverageKmL   = 0.0f;
   float        fuelLPer100Km    = 0.0f;
+  float        fuelRangeKm      = 0.0f;
+  float        tankCapacityL    = 0.0f;
   float        engineHealth     = 100.0f;
   float        throttlePct      = 0.0f;
   float        mapKpa           = 101.3f;
@@ -258,6 +276,9 @@ struct DashboardSnapshot {
   WarningLevel warningLevel     = WarningLevel::None;
   WarningReason warningReason   = WarningReason::None;
   bool         engineRunning    = false;
+  bool         fuelConsumptionEstimated = true;
+  MotorModel   motorModel       = MotorModel::Unknown;
+  char         motorName[32]    = "UNKNOWN";
   uint32_t     timestampMs      = 0;
 };
 
@@ -337,6 +358,7 @@ static const char* scanPhaseText(ScanPhase p) {
     case ScanPhase::KLineFastHonda:  return "K-LINE FAST -> HONDA (0x6A)";
     case ScanPhase::KLineFastYamaha: return "K-LINE FAST -> YAMAHA (0x85)";
     case ScanPhase::KLineFastKawasaki:return "K-LINE FAST -> KAWASAKI (0x84)";
+    case ScanPhase::KLineFastGeneric:return "K-LINE FAST -> GENERIC (0x33)";
     case ScanPhase::KLine5BaudHonda: return "K-LINE 5BAUD -> HONDA (0x6A)";
     case ScanPhase::KLine5BaudYamaha:return "K-LINE 5BAUD -> YAMAHA (0x85)";
     case ScanPhase::KLine5BaudYamahaAlt:return "K-LINE 5BAUD -> YAMAHA ALT (0x17)";
@@ -401,10 +423,30 @@ struct PidSlot {
   uint32_t intervalMs;
 };
 
-struct BrandProfile {
+struct TempLimits {
+  float normalMin;
+  float normalMax;
+  float warningTemp;
+  float dangerTemp;
+};
+
+struct MotorProfile {
+  MotorModel   model;
   BrandId      brandId;
+  const char*  id;
   const char*  name;
+  ProtocolType protocol;
+  ChecksumMode checksumMode;
   InitMethod   initMethod;
+  float        tankCapacityL;
+  float        wheelCircumferenceM;
+  float        rpmPulsePerRev;
+  float        speedPulsePerRev;
+  uint16_t     fuelAdcEmpty;
+  uint16_t     fuelAdcFull;
+  float        tpsVoltClosed;
+  float        tpsVoltOpen;
+  TempLimits   temp;
   uint8_t      ecuAddress;
   uint8_t      testerAddress;
   uint8_t      klineHeader;
@@ -415,184 +457,243 @@ struct BrandProfile {
   uint8_t      ackPrefixLen;
   PidSlot      pids[cfg::MAX_PIDS];
   uint8_t      pidCount;
+  bool         supportsEcuRpm;
+  bool         supportsEcuTemp;
+  bool         supportsEcuTps;
+  bool         supportsEcuVoltage;
+  bool         supportsDtc;
   uint32_t     canSpeed;
   uint32_t     canTxId;
   uint32_t     canRxId;
   bool         isCanBus;
 };
 
-static const BrandProfile PROFILE_HONDA = {
-  BrandId::Honda, "HONDA", InitMethod::FastInit,
+static const MotorProfile PROFILE_SENSOR_ONLY = {
+  MotorModel::SensorOnly, BrandId::Unknown, "sensor-only", "Manual Sensor Mode",
+  ProtocolType::None, ChecksumMode::Sum8, InitMethod::None,
+  3.5f, cfg::WHEEL_CIRCUMFERENCE_M, cfg::RPM_PULSES_PER_REV, cfg::SPEED_PULSES_PER_REV,
+  3800, 400, 0.50f, 4.50f, { 70.0f, 95.0f, 105.0f, 120.0f },
+  0, 0, 0, 0,
+  {}, 0, {}, 0, {}, 0,
+  false, false, false, false, false,
+  0, 0, 0, false
+};
+
+static const MotorProfile PROFILE_HONDA_VARIO125_KZR = {
+  MotorModel::HondaVario125Kzr, BrandId::Honda, "vario125kzr", "Honda Vario 125 KZR",
+  ProtocolType::HondaKLine, ChecksumMode::TwosComplement, InitMethod::FastInit,
+  5.5f, 1.720f, 1.0f, 1.0f,
+  3600, 550, 0.50f, 4.50f, { 70.0f, 95.0f, 100.0f, 115.0f },
   cfg::ECU_ADDR_HONDA, cfg::TESTER_ADDR, cfg::KLINE_HEADER, cfg::KLINE_BAUD,
   { 0xC1, 0xD1, 0x8F }, 3,
   { 0x83 }, 1,
   {
     { cfg::OBD_MODE_LIVE, cfg::PID_ENGINE_RPM, 80  },
-    { cfg::OBD_MODE_LIVE, cfg::PID_SPEED,      80  },
+    { cfg::OBD_MODE_LIVE, cfg::PID_SPEED,      100 },
     { cfg::OBD_MODE_LIVE, cfg::PID_COOLANT,    400 },
     { cfg::OBD_MODE_LIVE, cfg::PID_TPS,        150 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_O2_1,       200 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_MAP,        150 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_IAT,        500 },
+    { cfg::OBD_MODE_LIVE, cfg::PID_O2_1,       250 },
     { cfg::OBD_MODE_LIVE, cfg::PID_BATT,       800 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_STFT,       800 },
-    { cfg::OBD_MODE_LIVE, 0xD1, 200 },
-    { cfg::OBD_MODE_LIVE, 0xD2, 200 },
-    { cfg::OBD_MODE_DTC,  0x00, 5000 },
-  },
-  12,
-  0, 0, 0, false
-};
-
-static const BrandProfile PROFILE_YAMAHA = {
-  BrandId::Yamaha, "YAMAHA", InitMethod::FiveBaud,
-  cfg::ECU_ADDR_YAMAHA, cfg::TESTER_ADDR, 0x80, cfg::KLINE_BAUD,
-  { 0x81 }, 1,
-  { 0x83 }, 1,
-  {
-    { 0x21, 0x01, 100  },
-    { 0x21, 0x02, 150  },
-    { 0x21, 0x03, 400  },
-    { 0x21, 0x04, 800  },
-    { 0x21, 0x20, 200  },
-    { 0x21, 0x21, 500  },
-    { 0x21, 0x30, 200  },
-    { cfg::OBD_MODE_DTC, 0x00, 5000 },
-  },
-  8,
-  0, 0, 0, false
-};
-
-static const BrandProfile PROFILE_YAMAHA_ALT = {
-  BrandId::Yamaha, "YAMAHA ALT", InitMethod::FiveBaud,
-  cfg::ECU_ADDR_YAMAHA2, cfg::TESTER_ADDR, 0x80, cfg::KLINE_BAUD,
-  { 0x81 }, 1,
-  { 0x83 }, 1,
-  {
-    { 0x21, 0x01, 100 }, { 0x21, 0x02, 150 }, { 0x21, 0x03, 400 },
-    { 0x21, 0x04, 800 }, { 0x21, 0x20, 200 }, { cfg::OBD_MODE_DTC, 0x00, 5000 },
-  },
-  6,
-  0, 0, 0, false
-};
-
-static const BrandProfile PROFILE_SUZUKI = {
-  BrandId::Suzuki, "SUZUKI", InitMethod::FiveBaud,
-  cfg::ECU_ADDR_SUZUKI, cfg::TESTER_ADDR, cfg::KLINE_HEADER, cfg::KLINE_BAUD,
-  { 0x81 }, 1,
-  { 0x83 }, 1,
-  {
-    { cfg::OBD_MODE_LIVE, cfg::PID_ENGINE_RPM, 100 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_SPEED,      100 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_COOLANT,    500 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_TPS,        200 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_MAP,        200 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_IAT,        500 },
-    { cfg::OBD_MODE_DTC,  0x00, 5000 },
+    { cfg::OBD_MODE_DTC,  0x00,                5000 },
   },
   7,
+  true, true, true, true, true,
   0, 0, 0, false
 };
 
-static const BrandProfile PROFILE_KAWASAKI = {
-  BrandId::Kawasaki, "KAWASAKI", InitMethod::FastInit,
-  cfg::ECU_ADDR_KAWASAKI, cfg::TESTER_ADDR, cfg::KLINE_HEADER, cfg::KLINE_BAUD,
-  { 0xC1, 0xD1, 0x8F }, 3,
-  { 0x83 }, 1,
-  {
-    { cfg::OBD_MODE_LIVE, cfg::PID_ENGINE_RPM, 100 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_SPEED,      100 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_COOLANT,    500 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_TPS,        200 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_IAT,        500 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_BATT,       800 },
-    { cfg::OBD_MODE_DTC,  0x00, 5000 },
-  },
-  7,
-  0, 0, 0, false
-};
-
-static const BrandProfile PROFILE_GENERIC = {
-  BrandId::GenericObd2, "GENERIC OBD2", InitMethod::FastInit,
+static const MotorProfile PROFILE_GENERIC_KLINE = {
+  MotorModel::GenericKLine, BrandId::GenericObd2, "generic-kline", "Generic K-Line OBD2",
+  ProtocolType::GenericOBD2KLine, ChecksumMode::Sum8, InitMethod::FastInit,
+  4.0f, cfg::WHEEL_CIRCUMFERENCE_M, cfg::RPM_PULSES_PER_REV, cfg::SPEED_PULSES_PER_REV,
+  3800, 400, 0.50f, 4.50f, { 70.0f, 95.0f, 105.0f, 120.0f },
   cfg::ECU_ADDR_GENERIC, cfg::TESTER_ADDR, cfg::KLINE_HEADER, cfg::KLINE_BAUD,
   { 0xC1, 0xD1, 0x8F }, 3,
   { 0x83 }, 1,
   {
     { cfg::OBD_MODE_LIVE, cfg::PID_ENGINE_RPM, 100 },
     { cfg::OBD_MODE_LIVE, cfg::PID_SPEED,      100 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_COOLANT,    500 },
     { cfg::OBD_MODE_LIVE, cfg::PID_TPS,        200 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_O2_1,       250 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_MAP,        200 },
-    { cfg::OBD_MODE_LIVE, cfg::PID_IAT,        500 },
+    { cfg::OBD_MODE_LIVE, cfg::PID_COOLANT,    500 },
     { cfg::OBD_MODE_LIVE, cfg::PID_BATT,       800 },
-    { cfg::OBD_MODE_DTC,  0x00, 5000 },
+    { cfg::OBD_MODE_DTC,  0x00,                5000 },
   },
-  9,
+  6,
+  true, true, true, true, true,
   0, 0, 0, false
 };
 
-static const BrandProfile PROFILE_DUCATI = {
-  BrandId::Ducati, "DUCATI", InitMethod::None,
-  0, 0, 0, 0,
-  {}, 0, {}, 0,
-  {}, 0,
+static const MotorProfile PROFILE_YAMAHA = {
+  MotorModel::YamahaGeneric, BrandId::Yamaha, "yamaha-kline", "Yamaha K-Line",
+  ProtocolType::YamahaKLine, ChecksumMode::Sum8, InitMethod::FiveBaudInit,
+  4.2f, cfg::WHEEL_CIRCUMFERENCE_M, cfg::RPM_PULSES_PER_REV, cfg::SPEED_PULSES_PER_REV,
+  3800, 400, 0.50f, 4.50f, { 70.0f, 95.0f, 105.0f, 120.0f },
+  cfg::ECU_ADDR_YAMAHA, cfg::TESTER_ADDR, 0x80, cfg::KLINE_BAUD,
+  { 0x81 }, 1, { 0x83 }, 1,
+  {
+    { 0x21, 0x01, 100 }, { 0x21, 0x02, 150 }, { 0x21, 0x03, 400 },
+    { 0x21, 0x04, 800 }, { 0x21, 0x20, 200 }, { 0x21, 0x21, 500 },
+    { 0x21, 0x30, 200 }, { cfg::OBD_MODE_DTC, 0x00, 5000 },
+  },
+  8,
+  true, true, true, true, true,
+  0, 0, 0, false
+};
+
+static const MotorProfile PROFILE_YAMAHA_ALT = {
+  MotorModel::YamahaAlt, BrandId::Yamaha, "yamaha-alt-kline", "Yamaha K-Line ALT",
+  ProtocolType::YamahaKLine, ChecksumMode::Sum8, InitMethod::FiveBaudInit,
+  4.2f, cfg::WHEEL_CIRCUMFERENCE_M, cfg::RPM_PULSES_PER_REV, cfg::SPEED_PULSES_PER_REV,
+  3800, 400, 0.50f, 4.50f, { 70.0f, 95.0f, 105.0f, 120.0f },
+  cfg::ECU_ADDR_YAMAHA2, cfg::TESTER_ADDR, 0x80, cfg::KLINE_BAUD,
+  { 0x81 }, 1, { 0x83 }, 1,
+  {
+    { 0x21, 0x01, 100 }, { 0x21, 0x02, 150 }, { 0x21, 0x03, 400 },
+    { 0x21, 0x04, 800 }, { 0x21, 0x20, 200 }, { cfg::OBD_MODE_DTC, 0x00, 5000 },
+  },
+  6,
+  true, true, true, true, true,
+  0, 0, 0, false
+};
+
+static const MotorProfile PROFILE_SUZUKI = {
+  MotorModel::SuzukiGeneric, BrandId::Suzuki, "suzuki-kline", "Suzuki K-Line",
+  ProtocolType::SuzukiKLine, ChecksumMode::Sum8, InitMethod::FiveBaudInit,
+  4.0f, cfg::WHEEL_CIRCUMFERENCE_M, cfg::RPM_PULSES_PER_REV, cfg::SPEED_PULSES_PER_REV,
+  3800, 400, 0.50f, 4.50f, { 70.0f, 95.0f, 105.0f, 120.0f },
+  cfg::ECU_ADDR_SUZUKI, cfg::TESTER_ADDR, cfg::KLINE_HEADER, cfg::KLINE_BAUD,
+  { 0x81 }, 1, { 0x83 }, 1,
+  {
+    { cfg::OBD_MODE_LIVE, cfg::PID_ENGINE_RPM, 100 },
+    { cfg::OBD_MODE_LIVE, cfg::PID_SPEED,      100 },
+    { cfg::OBD_MODE_LIVE, cfg::PID_COOLANT,    500 },
+    { cfg::OBD_MODE_LIVE, cfg::PID_TPS,        200 },
+    { cfg::OBD_MODE_LIVE, cfg::PID_MAP,        200 },
+    { cfg::OBD_MODE_LIVE, cfg::PID_IAT,        500 },
+    { cfg::OBD_MODE_DTC,  0x00,                5000 },
+  },
+  7,
+  true, true, true, false, true,
+  0, 0, 0, false
+};
+
+static const MotorProfile PROFILE_KAWASAKI = {
+  MotorModel::KawasakiGeneric, BrandId::Kawasaki, "kawasaki-kline", "Kawasaki K-Line",
+  ProtocolType::KawasakiKLine, ChecksumMode::Sum8, InitMethod::FastInit,
+  4.0f, cfg::WHEEL_CIRCUMFERENCE_M, cfg::RPM_PULSES_PER_REV, cfg::SPEED_PULSES_PER_REV,
+  3800, 400, 0.50f, 4.50f, { 70.0f, 95.0f, 105.0f, 120.0f },
+  cfg::ECU_ADDR_KAWASAKI, cfg::TESTER_ADDR, cfg::KLINE_HEADER, cfg::KLINE_BAUD,
+  { 0xC1, 0xD1, 0x8F }, 3, { 0x83 }, 1,
+  {
+    { cfg::OBD_MODE_LIVE, cfg::PID_ENGINE_RPM, 100 },
+    { cfg::OBD_MODE_LIVE, cfg::PID_SPEED,      100 },
+    { cfg::OBD_MODE_LIVE, cfg::PID_COOLANT,    500 },
+    { cfg::OBD_MODE_LIVE, cfg::PID_TPS,        200 },
+    { cfg::OBD_MODE_LIVE, cfg::PID_IAT,        500 },
+    { cfg::OBD_MODE_LIVE, cfg::PID_BATT,       800 },
+    { cfg::OBD_MODE_DTC,  0x00,                5000 },
+  },
+  7,
+  true, true, true, true, true,
+  0, 0, 0, false
+};
+
+static const MotorProfile PROFILE_DUCATI = {
+  MotorModel::DucatiCan, BrandId::Ducati, "ducati-can", "Ducati CAN Scaffold",
+  ProtocolType::CAN, ChecksumMode::Sum8, InitMethod::None,
+  4.0f, cfg::WHEEL_CIRCUMFERENCE_M, 1.0f, 1.0f,
+  3800, 400, 0.50f, 4.50f, { 70.0f, 95.0f, 105.0f, 120.0f },
+  0, 0, 0, 0, {}, 0, {}, 0, {}, 0,
+  false, false, false, false, false,
   1000000UL, 0x143, 0x144, true
 };
 
-static const BrandProfile PROFILE_BMW = {
-  BrandId::BMW, "BMW", InitMethod::None,
-  0, 0, 0, 0,
-  {}, 0, {}, 0,
-  {}, 0,
+static const MotorProfile PROFILE_BMW = {
+  MotorModel::BmwCan, BrandId::BMW, "bmw-can", "BMW CAN Scaffold",
+  ProtocolType::CAN, ChecksumMode::Sum8, InitMethod::None,
+  4.0f, cfg::WHEEL_CIRCUMFERENCE_M, 1.0f, 1.0f,
+  3800, 400, 0.50f, 4.50f, { 70.0f, 95.0f, 105.0f, 120.0f },
+  0, 0, 0, 0, {}, 0, {}, 0, {}, 0,
+  false, false, false, false, false,
   500000UL, 0x612, 0x613, true
 };
 
-static const BrandProfile PROFILE_KTM = {
-  BrandId::KTM, "KTM", InitMethod::None,
-  0, 0, 0, 0,
-  {}, 0, {}, 0,
-  {}, 0,
+static const MotorProfile PROFILE_KTM = {
+  MotorModel::KtmCan, BrandId::KTM, "ktm-can", "KTM CAN Scaffold",
+  ProtocolType::CAN, ChecksumMode::Sum8, InitMethod::None,
+  4.0f, cfg::WHEEL_CIRCUMFERENCE_M, 1.0f, 1.0f,
+  3800, 400, 0.50f, 4.50f, { 70.0f, 95.0f, 105.0f, 120.0f },
+  0, 0, 0, 0, {}, 0, {}, 0, {}, 0,
+  false, false, false, false, false,
   250000UL, 0x201, 0x211, true
 };
 
 struct ScanCandidate {
   ScanPhase          phase;
-  const BrandProfile* profile;
+  const MotorProfile* profile;
 };
 
 static const ScanCandidate SCAN_CANDIDATES[] = {
-  { ScanPhase::KLineFastHonda,    &PROFILE_HONDA    },
-  { ScanPhase::KLineFastKawasaki, &PROFILE_KAWASAKI },
-  { ScanPhase::KLineFastYamaha,   &PROFILE_YAMAHA   },
-  { ScanPhase::KLine5BaudYamaha,  &PROFILE_YAMAHA   },
-  { ScanPhase::KLine5BaudYamahaAlt, &PROFILE_YAMAHA_ALT },
-  { ScanPhase::KLine5BaudSuzuki,  &PROFILE_SUZUKI   },
-  { ScanPhase::KLine5BaudHonda,   &PROFILE_HONDA    },
-  { ScanPhase::CanBus125k,        &PROFILE_GENERIC  },
-  { ScanPhase::CanBus250k,        &PROFILE_KTM      },
-  { ScanPhase::CanBus500k,        &PROFILE_BMW      },
-  { ScanPhase::CanBus1M,          &PROFILE_DUCATI   },
+  { ScanPhase::KLineFastHonda,       &PROFILE_HONDA_VARIO125_KZR },
+  { ScanPhase::KLineFastKawasaki,    &PROFILE_KAWASAKI           },
+  { ScanPhase::KLineFastYamaha,      &PROFILE_YAMAHA             },
+  { ScanPhase::KLine5BaudYamaha,     &PROFILE_YAMAHA             },
+  { ScanPhase::KLine5BaudYamahaAlt,  &PROFILE_YAMAHA_ALT         },
+  { ScanPhase::KLine5BaudSuzuki,     &PROFILE_SUZUKI             },
+  { ScanPhase::KLine5BaudHonda,      &PROFILE_HONDA_VARIO125_KZR },
+  { ScanPhase::KLineFastGeneric,     &PROFILE_GENERIC_KLINE      },
+  { ScanPhase::CanBus250k,           &PROFILE_KTM                },
+  { ScanPhase::CanBus500k,           &PROFILE_BMW                },
+  { ScanPhase::CanBus1M,             &PROFILE_DUCATI             },
 };
 static constexpr size_t SCAN_CANDIDATE_COUNT = sizeof(SCAN_CANDIDATES) / sizeof(SCAN_CANDIDATES[0]);
 
-static const BrandProfile* profileForBrand(BrandId id) {
+static const MotorProfile* const USER_PROFILES[] = {
+  &PROFILE_HONDA_VARIO125_KZR,
+  &PROFILE_GENERIC_KLINE,
+  &PROFILE_SENSOR_ONLY,
+  &PROFILE_YAMAHA,
+  &PROFILE_YAMAHA_ALT,
+  &PROFILE_SUZUKI,
+  &PROFILE_KAWASAKI,
+};
+static constexpr size_t USER_PROFILE_COUNT = sizeof(USER_PROFILES) / sizeof(USER_PROFILES[0]);
+
+static const MotorProfile* activeProfile = &PROFILE_SENSOR_ONLY;
+
+static const MotorProfile* getDefaultProfile() {
+  return &PROFILE_SENSOR_ONLY;
+}
+
+static const char* getProfileName(const MotorProfile* profile) {
+  return profile ? profile->name : "UNKNOWN";
+}
+
+static const MotorProfile* findProfile(const char* id) {
+  if (!id || !*id) return nullptr;
+  for (size_t i = 0; i < USER_PROFILE_COUNT; ++i) {
+    if (strcmp(USER_PROFILES[i]->id, id) == 0) return USER_PROFILES[i];
+  }
+  return nullptr;
+}
+
+static const MotorProfile* profileForBrand(BrandId id) {
   switch(id) {
-    case BrandId::Honda:     return &PROFILE_HONDA;
+    case BrandId::Honda:     return &PROFILE_HONDA_VARIO125_KZR;
     case BrandId::Yamaha:    return &PROFILE_YAMAHA;
     case BrandId::Suzuki:    return &PROFILE_SUZUKI;
     case BrandId::Kawasaki:  return &PROFILE_KAWASAKI;
     case BrandId::Ducati:    return &PROFILE_DUCATI;
     case BrandId::BMW:       return &PROFILE_BMW;
     case BrandId::KTM:       return &PROFILE_KTM;
-    default:                 return &PROFILE_GENERIC;
+    default:                 return &PROFILE_GENERIC_KLINE;
   }
 }
 
-static const BrandProfile* profileForScanResult(const ScanResult& result) {
+static const MotorProfile* profileForScanResult(const ScanResult& result) {
   for (size_t i = 0; i < SCAN_CANDIDATE_COUNT; ++i) {
-    const BrandProfile* profile = SCAN_CANDIDATES[i].profile;
+    const MotorProfile* profile = SCAN_CANDIDATES[i].profile;
     if (!profile) continue;
+    if (strcmp(profile->id, result.profileId) == 0) return profile;
     if (profile->brandId == result.brand &&
         profile->ecuAddress == result.ecuAddress &&
         profile->initMethod == result.initMethod) {
@@ -602,27 +703,68 @@ static const BrandProfile* profileForScanResult(const ScanResult& result) {
   return profileForBrand(result.brand);
 }
 
+static const char* protocolText(ProtocolType protocol) {
+  switch (protocol) {
+    case ProtocolType::None: return "None";
+    case ProtocolType::HondaKLine: return "Honda K-Line";
+    case ProtocolType::GenericOBD2KLine: return "Generic OBD2 K-Line";
+    case ProtocolType::CAN: return "CAN";
+    case ProtocolType::YamahaKLine: return "Yamaha K-Line";
+    case ProtocolType::SuzukiKLine: return "Suzuki K-Line";
+    case ProtocolType::KawasakiKLine: return "Kawasaki K-Line";
+    case ProtocolType::ISO9141_5Baud: return "ISO9141 5-Baud";
+    case ProtocolType::KWP2000_FastInit: return "KWP2000 Fast Init";
+    default: return "Unknown";
+  }
+}
+
+static const char* checksumText(ChecksumMode mode) {
+  switch (mode) {
+    case ChecksumMode::TwosComplement: return "TwosComplement";
+    case ChecksumMode::Sum8:
+    default: return "Sum8";
+  }
+}
+
+static const char* initMethodText(InitMethod method) {
+  switch (method) {
+    case InitMethod::FastInit: return "FastInit";
+    case InitMethod::FiveBaudInit: return "FiveBaudInit";
+    default: return "None";
+  }
+}
+
+struct ProfileDetectResult {
+  const MotorProfile* profile = nullptr;
+  uint8_t confidence = 0;
+  bool confident = false;
+};
+
 // ============================================================================
 // K-line helpers and protocol management
 // ============================================================================
 class PacketValidator {
 public:
-  static uint8_t checksum(const uint8_t* data, size_t len) {
+  static uint8_t checksum(const uint8_t* data, size_t len, ChecksumMode mode) {
     uint16_t s = 0;
     for (size_t i = 0; i < len; ++i) s += data[i];
-    return static_cast<uint8_t>(s & 0xFF);
+    const uint8_t sum8 = static_cast<uint8_t>(s & 0xFF);
+    if (mode == ChecksumMode::TwosComplement) {
+      return static_cast<uint8_t>((0x100U - sum8) & 0xFFU);
+    }
+    return sum8;
   }
   static bool isHeaderValid(uint8_t h) {
     return h==0x68 || h==0x80 || h==0xC2 || h==0x02 || h==0x0E || h==0x83;
   }
-  static bool validate(const uint8_t* raw, size_t rawLen) {
+  static bool validate(const uint8_t* raw, size_t rawLen, ChecksumMode mode) {
     if (!raw || rawLen < 5) return false;
     if (!isHeaderValid(raw[0])) return false;
     uint8_t len = raw[3];
     if (len > cfg::MAX_ECU_PAYLOAD) return false;
     size_t total = 4u + len + 1u;
     if (rawLen < total) return false;
-    return checksum(raw, 4+len) == raw[4+len];
+    return checksum(raw, 4+len, mode) == raw[4+len];
   }
 };
 
@@ -630,15 +772,17 @@ class KWP2000Handler {
 public:
   static size_t buildRequest(uint8_t* out, size_t outSize,
                              uint8_t header, uint8_t target,
-                             uint8_t source, uint8_t service, uint8_t pid) {
+                             uint8_t source, uint8_t service, uint8_t pid,
+                             ChecksumMode checksumMode) {
     if (!out || outSize < 7) return 0;
     out[0] = header; out[1] = target; out[2] = source;
     out[3] = 0x02;   out[4] = service; out[5] = pid;
-    out[6] = PacketValidator::checksum(out, 6);
+    out[6] = PacketValidator::checksum(out, 6, checksumMode);
     return 7;
   }
-  static bool parseFrame(const uint8_t* raw, size_t rawLen, ECUFrame& frame) {
-    if (!PacketValidator::validate(raw, rawLen)) return false;
+  static bool parseFrame(const uint8_t* raw, size_t rawLen, ECUFrame& frame,
+                         ChecksumMode checksumMode) {
+    if (!PacketValidator::validate(raw, rawLen, checksumMode)) return false;
     frame.header     = raw[0]; frame.target = raw[1];
     frame.source     = raw[2]; frame.length = raw[3];
     frame.payloadLen = raw[3]; frame.checksum = raw[4+raw[3]];
@@ -652,7 +796,7 @@ class KLineInitiator {
 public:
   static bool fastInit(HardwareSerial& serial,
                        int16_t txPin, int16_t rxPin,
-                       const BrandProfile& profile) {
+                       const MotorProfile& profile) {
     serial.end();
     pinMode(static_cast<uint8_t>(txPin), OUTPUT);
     digitalWrite(static_cast<uint8_t>(txPin), HIGH);
@@ -675,7 +819,7 @@ public:
 
   static bool fiveBaudInit(HardwareSerial& serial,
                             int16_t txPin, int16_t rxPin,
-                            const BrandProfile& profile) {
+                            const MotorProfile& profile) {
     serial.end();
     pinMode(static_cast<uint8_t>(txPin), OUTPUT);
     digitalWrite(static_cast<uint8_t>(txPin), HIGH);
@@ -687,17 +831,27 @@ public:
     serial.setTimeout(cfg::KLINE_STARTCOMM_TMO_MS);
     delay(5);
     while (serial.available()) serial.read();
-    uint32_t t0 = millis();
-    uint8_t  rxCount = 0;
-    while (rxCount < 3 && (millis()-t0) < 1500) {
-      if (serial.available()) { serial.read(); rxCount++; }
-      yield();
+    uint8_t sync = 0, key1 = 0, key2 = 0;
+    if (!readByteWithin(serial, sync, 1500) || sync != 0x55) {
+      if (cfg::DEBUG_MODE) Serial.printf("[KLINE] 5-baud sync fail: 0x%02X\n", sync);
+      return false;
     }
-    if (rxCount < 3) return false;
+    if (!readByteWithin(serial, key1, 300) || !readByteWithin(serial, key2, 300)) {
+      if (cfg::DEBUG_MODE) Serial.println("[KLINE] 5-baud key read timeout");
+      return false;
+    }
     delay(20);
-    serial.write(0x57);
+    const uint8_t inverseKey2 = static_cast<uint8_t>(~key2);
+    serial.write(inverseKey2);
     delay(25);
-    while (serial.available()) serial.read();
+    uint8_t finalAck = 0;
+    const bool gotFinalAck = readByteWithin(serial, finalAck, 150);
+    if (cfg::DEBUG_MODE) {
+      Serial.printf("[KLINE] 5-baud sync=0x%02X key1=0x%02X key2=0x%02X sent=0x%02X",
+                    sync, key1, key2, inverseKey2);
+      if (gotFinalAck) Serial.printf(" ack=0x%02X\n", finalAck);
+      else Serial.println(" ack=--");
+    }
     for (uint8_t i = 0; i < profile.startCommLen; ++i) {
       serial.write(profile.startCommBytes[i]);
       delay(cfg::KLINE_INTER_BYTE_MS);
@@ -719,7 +873,7 @@ private:
   }
 
   static bool waitForAck(HardwareSerial& serial,
-                          const BrandProfile& profile,
+                          const MotorProfile& profile,
                           uint32_t timeoutMs) {
     uint32_t t0 = millis();
     uint8_t  rxBuf[8] = {};
@@ -740,6 +894,18 @@ private:
     }
     return false;
   }
+
+  static bool readByteWithin(HardwareSerial& serial, uint8_t& out, uint32_t timeoutMs) {
+    const uint32_t t0 = millis();
+    while ((millis() - t0) < timeoutMs) {
+      if (serial.available()) {
+        out = static_cast<uint8_t>(serial.read());
+        return true;
+      }
+      yield();
+    }
+    return false;
+  }
 };
 
 class KLineManager {
@@ -749,7 +915,8 @@ public:
       _protocol(ProtocolType::Unknown), _enabled(false), _connected(false),
       _requestPending(false), _rxPin(-1), _txPin(-1),
       _baud(cfg::KLINE_BAUD), _lastRxMs(0), _lastRetryMs(0),
-      _lastRequestMs(0), _errorCount(0), _rxLen(0), _haveFrame(false) {}
+      _lastRequestMs(0), _errorCount(0), _checksumMode(ChecksumMode::Sum8),
+      _rxLen(0), _haveFrame(false), _echoLen(0), _echoIdx(0), _echoStartMs(0) {}
 
   bool begin(int16_t rxPin, int16_t txPin, uint32_t baud) {
     _rxPin = rxPin; _txPin = txPin; _baud = baud;
@@ -778,9 +945,19 @@ public:
   void reinit(int16_t rxPin, int16_t txPin, uint32_t baud) {
     _rxPin = rxPin; _txPin = txPin; _baud = baud;
     _serial.end();
-    delay(10);
     _serial.begin(_baud, SERIAL_8N1, _rxPin, _txPin);
     _serial.setTimeout(cfg::KLINE_RX_TIMEOUT_MS);
+    clearEchoFilter();
+  }
+
+  void setProfile(const MotorProfile* profile) {
+    if (!profile) profile = getDefaultProfile();
+    _checksumMode = profile->checksumMode;
+    if (profile->protocol == ProtocolType::None) {
+      _protocol = ProtocolType::None;
+    } else {
+      _protocol = profile->protocol;
+    }
   }
 
   void update() {
@@ -800,9 +977,10 @@ public:
   bool sendRequest(uint8_t header, uint8_t target, uint8_t tester, uint8_t service, uint8_t pid) {
     if (!_enabled || !_connected || _requestPending) return false;
     uint8_t frame[8] = {};
-    size_t len = KWP2000Handler::buildRequest(frame, sizeof(frame), header, target, tester, service, pid);
+    size_t len = KWP2000Handler::buildRequest(frame, sizeof(frame), header, target, tester, service, pid, _checksumMode);
     if (!len) return false;
     _serial.write(frame, len);
+    armEchoFilter(frame, len);
     _lastRequestMs = millis(); _requestPending = true;
     _state = EcuState::WaitingResponse;
     return true;
@@ -833,14 +1011,20 @@ private:
   uint32_t _baud;
   uint32_t _lastRxMs, _lastRetryMs, _lastRequestMs;
   uint32_t _errorCount;
+  ChecksumMode _checksumMode;
   uint8_t  _rxBuffer[cfg::MAX_ECU_FRAME];
   size_t   _rxLen;
   ECUFrame _pendingFrame;
   bool     _haveFrame;
+  uint8_t  _echoBuf[16];
+  size_t   _echoLen;
+  size_t   _echoIdx;
+  uint32_t _echoStartMs;
 
   void readIncoming() {
     while (_serial.available()) {
       uint8_t b = static_cast<uint8_t>(_serial.read());
+      if (filterEchoByte(b, millis())) continue;
       if (_rxLen < sizeof(_rxBuffer)) _rxBuffer[_rxLen++] = b;
       else { memmove(_rxBuffer, _rxBuffer+1, sizeof(_rxBuffer)-1); _rxBuffer[sizeof(_rxBuffer)-1]=b; _errorCount++; }
     }
@@ -850,7 +1034,7 @@ private:
       if (flen > sizeof(_rxBuffer)) { shiftBuf(1); _errorCount++; continue; }
       if (_rxLen < flen) return;
       ECUFrame f;
-      if (KWP2000Handler::parseFrame(_rxBuffer, flen, f)) {
+      if (KWP2000Handler::parseFrame(_rxBuffer, flen, f, _checksumMode)) {
         _pendingFrame = f; _haveFrame = true;
         _requestPending = false; _lastRxMs = millis();
         if (cfg::DEBUG_MODE) Serial.printf("[KLINE] RX len=%u pay=%u\n", (unsigned)flen, (unsigned)f.payloadLen);
@@ -864,6 +1048,31 @@ private:
     if (n >= _rxLen) { _rxLen = 0; return; }
     memmove(_rxBuffer, _rxBuffer+n, _rxLen-n); _rxLen -= n;
   }
+  void armEchoFilter(const uint8_t* data, size_t len) {
+    _echoLen = (len < sizeof(_echoBuf)) ? len : sizeof(_echoBuf);
+    for (size_t i = 0; i < _echoLen; ++i) _echoBuf[i] = data[i];
+    _echoIdx = 0;
+    _echoStartMs = millis();
+  }
+  void clearEchoFilter() {
+    _echoLen = 0;
+    _echoIdx = 0;
+    _echoStartMs = 0;
+  }
+  bool filterEchoByte(uint8_t b, uint32_t now) {
+    if (_echoIdx >= _echoLen || _echoLen == 0) return false;
+    if ((now - _echoStartMs) > cfg::KLINE_ECHO_WINDOW_MS) {
+      clearEchoFilter();
+      return false;
+    }
+    if (b == _echoBuf[_echoIdx]) {
+      _echoIdx++;
+      if (_echoIdx >= _echoLen) clearEchoFilter();
+      return true;
+    }
+    clearEchoFilter();
+    return false;
+  }
   static inline bool pinActive(int16_t p) { return p >= 0; }
 };
 
@@ -871,23 +1080,28 @@ class SensorHub;
 
 class ECUDataParser {
 public:
-  static void parse(const ECUFrame& frame, SensorHub& hub, BrandId brand);
+  static void parse(const ECUFrame& frame, SensorHub& hub, const MotorProfile& profile);
 };
 
 class ProtocolScanner {
 public:
-  void begin(KLineManager& kline) {
+  void begin(KLineManager& kline, const MotorProfile* preferredProfile = nullptr) {
     _kline         = &kline;
     _candidateIdx  = 0;
     _phase         = ScanPhase::Idle;
     _phaseStart    = 0;
     _scanStart     = millis();
     _done          = false;
+    _preferredOnly = preferredProfile != nullptr;
+    if (_preferredOnly) {
+      _preferredCandidate.phase = scanPhaseForProfile(*preferredProfile);
+      _preferredCandidate.profile = preferredProfile;
+    }
     _currentDesc[0]= '\0';
     _statusMsg[0]  = '\0';
     if (cfg::DEBUG_MODE) {
       Serial.println("[SCAN] Starting universal ECU scan...");
-      Serial.printf("[SCAN] %u candidates\n", (unsigned)SCAN_CANDIDATE_COUNT);
+      Serial.printf("[SCAN] %u candidates\n", (unsigned)candidateCount());
     }
   }
 
@@ -896,11 +1110,11 @@ public:
     if (!_kline) { _done = true; return true; }
     const uint32_t now = millis();
     if ((now - _scanStart) > cfg::SCAN_TOTAL_TMO_MS) { finishFailed(); return true; }
-    if (_candidateIdx >= SCAN_CANDIDATE_COUNT) { finishFailed(); return true; }
-    const ScanCandidate& cand = SCAN_CANDIDATES[_candidateIdx];
-    if (cand.phase == ScanPhase::CanBus125k ||
-        cand.phase == ScanPhase::CanBus250k ||
-        cand.phase == ScanPhase::CanBus500k ||
+    if (_candidateIdx >= candidateCount()) { finishFailed(); return true; }
+    const ScanCandidate& cand = candidateAt(_candidateIdx);
+    if (!cand.profile) { finishFailed(); return true; }
+    if (cand.profile->isCanBus || cand.phase == ScanPhase::CanBus125k ||
+        cand.phase == ScanPhase::CanBus250k || cand.phase == ScanPhase::CanBus500k ||
         cand.phase == ScanPhase::CanBus1M) {
       if (cfg::DEBUG_MODE)
         Serial.printf("[SCAN] Skip CAN %s (Fase 3 HW required)\n", scanPhaseText(cand.phase));
@@ -916,21 +1130,20 @@ public:
       if (cfg::DEBUG_MODE)
         Serial.printf("[SCAN] Trying %s ...\n", _currentDesc);
       bool ok = false;
-      const BrandProfile& prof = *cand.profile;
-      if (cand.phase == ScanPhase::KLineFastHonda  ||
-          cand.phase == ScanPhase::KLineFastYamaha  ||
-          cand.phase == ScanPhase::KLineFastKawasaki) {
+      const MotorProfile& prof = *cand.profile;
+      _kline->setProfile(&prof);
+      if (prof.initMethod == InitMethod::FastInit) {
         ok = KLineInitiator::fastInit(_kline->serial(),
                                       _kline->txPin(), _kline->rxPin(), prof);
-      } else {
+      } else if (prof.initMethod == InitMethod::FiveBaudInit) {
         ok = KLineInitiator::fiveBaudInit(_kline->serial(),
                                           _kline->txPin(), _kline->rxPin(), prof);
+      } else {
+        ok = false;
       }
       if (ok) {
         _kline->reinit(_kline->rxPin(), _kline->txPin(), prof.baudRate);
-        ProtocolType proto = (prof.initMethod == InitMethod::FastInit)
-                              ? ProtocolType::KWP2000_FastInit
-                              : ProtocolType::ISO9141_5Baud;
+        ProtocolType proto = prof.protocol;
         _kline->markConnected(proto);
         finishSuccess(cand, proto);
         return true;
@@ -952,7 +1165,7 @@ public:
   const char*   statusMsg()const { return _statusMsg; }
   const char*   currentDesc() const { return _currentDesc; }
   uint8_t       candidateIdx() const { return _candidateIdx; }
-  uint8_t       candidateCount() const { return static_cast<uint8_t>(SCAN_CANDIDATE_COUNT); }
+  uint8_t       candidateCount() const { return _preferredOnly ? 1 : static_cast<uint8_t>(SCAN_CANDIDATE_COUNT); }
 
 private:
   KLineManager* _kline         = nullptr;
@@ -961,9 +1174,39 @@ private:
   uint32_t      _phaseStart    = 0;
   uint32_t      _scanStart     = 0;
   bool          _done          = false;
+  bool          _preferredOnly = false;
+  ScanCandidate _preferredCandidate = { ScanPhase::Idle, nullptr };
   ScanResult    _result        = {};
   char          _currentDesc[48] = {};
   char          _statusMsg[64]   = {};
+
+  const ScanCandidate& candidateAt(uint8_t idx) const {
+    return _preferredOnly ? _preferredCandidate : SCAN_CANDIDATES[idx];
+  }
+
+  static ScanPhase scanPhaseForProfile(const MotorProfile& profile) {
+    if (profile.protocol == ProtocolType::CAN) return ScanPhase::CanBus500k;
+    if (profile.initMethod == InitMethod::FiveBaudInit) {
+      if (profile.model == MotorModel::YamahaAlt) return ScanPhase::KLine5BaudYamahaAlt;
+      if (profile.brandId == BrandId::Yamaha) return ScanPhase::KLine5BaudYamaha;
+      if (profile.brandId == BrandId::Suzuki) return ScanPhase::KLine5BaudSuzuki;
+      return ScanPhase::KLine5BaudHonda;
+    }
+    if (profile.brandId == BrandId::Kawasaki) return ScanPhase::KLineFastKawasaki;
+    if (profile.brandId == BrandId::Yamaha) return ScanPhase::KLineFastYamaha;
+    if (profile.protocol == ProtocolType::GenericOBD2KLine) return ScanPhase::KLineFastGeneric;
+    return ScanPhase::KLineFastHonda;
+  }
+
+  static uint8_t confidenceForProfile(const MotorProfile& profile) {
+    uint8_t score = 30; // K-Line init berhasil
+    if (profile.ackPrefixLen > 0) score += 30; // response pattern sesuai kandidat
+    if (profile.pidCount > 0) score += 10;     // ada PID dasar yang dikenal
+    if (profile.checksumMode == ChecksumMode::Sum8 ||
+        profile.checksumMode == ChecksumMode::TwosComplement) score += 10;
+    if (profile.supportsEcuRpm || profile.supportsEcuTemp || profile.supportsEcuTps) score += 10;
+    return score > 100 ? 100 : score;
+  }
 
   void finishSuccess(const ScanCandidate& cand, ProtocolType proto) {
     _done = true;
@@ -975,15 +1218,17 @@ private:
     _result.ecuAddress     = cand.profile->ecuAddress;
     _result.baudRate       = cand.profile->baudRate;
     _result.pidsFound      = cand.profile->pidCount;
+    _result.confidence     = confidenceForProfile(*cand.profile);
     _result.scanDurationMs = millis() - _scanStart;
+    strncpy(_result.profileId, cand.profile->id, sizeof(_result.profileId)-1);
     strncpy(_result.brandName, cand.profile->name, sizeof(_result.brandName)-1);
-    const char* pname = (proto == ProtocolType::KWP2000_FastInit) ? "KWP2000 Fast Init" : "ISO 9141-2 5-Baud";
-    strncpy(_result.protoName, pname, sizeof(_result.protoName)-1);
+    strncpy(_result.protoName, protocolText(proto), sizeof(_result.protoName)-1);
     snprintf(_statusMsg, sizeof(_statusMsg), "DETECTED: %s %s", _result.brandName, _result.protoName);
     if (cfg::DEBUG_MODE)
-      Serial.printf("[SCAN] OK %s via %s addr=0x%02X in %lums\n",
+      Serial.printf("[SCAN] OK %s via %s addr=0x%02X confidence=%u in %lums\n",
                     _result.brandName, _result.protoName,
-                    _result.ecuAddress, (unsigned long)_result.scanDurationMs);
+                    _result.ecuAddress, _result.confidence,
+                    (unsigned long)_result.scanDurationMs);
   }
 
   void finishFailed() {
@@ -1041,10 +1286,10 @@ public:
 class SensorHub {
 public:
   SensorHub()
-    : _simMode(cfg::SIMULATION_MODE), _ecuEnabled(false), _ecuOnline(false),
+    : _profile(getDefaultProfile()), _simMode(cfg::SIMULATION_MODE), _ecuEnabled(false), _ecuOnline(false),
       _lastFastMs(0), _lastSlowMs(0), _lastSimMs(0),
       _lastDistMs(0), _lastRpmMs(0), _lastSpdMs(0),
-      _prevRpm(0), _prevSpd(0), _distM(0.f), _simPh(0.f) {
+      _prevRpm(0), _prevSpd(0), _distM(0.f), _simPh(0.f), _fuelAvgKmL(0.f) {
     for(size_t i=0;i<SENSOR_COUNT;i++) _s[i].timeoutMs=SENSOR_TIMEOUTS[i];
   }
 
@@ -1054,12 +1299,18 @@ public:
     setAtt(cfg::PIN_AFR_ADC); setAtt(cfg::PIN_TEMP_ADC);
     setAtt(cfg::PIN_BATT_ADC); setAtt(cfg::PIN_FUEL_ADC);
     setAtt(cfg::PIN_TPS_ADC); setAtt(cfg::PIN_MAP_ADC);
+    // GPIO34/GPIO35 ESP32 tidak punya internal pull-up. RPM/speed wajib pakai
+    // pull-up eksternal 10k ke 3.3V dan signal conditioner/opto, bukan pulser/coil langsung.
     if(cfg::PIN_RPM>=0){ pinMode(cfg::PIN_RPM,INPUT); attachInterrupt(digitalPinToInterrupt(cfg::PIN_RPM),isrRpm,FALLING); }
     if(cfg::PIN_SPEED>=0){ pinMode(cfg::PIN_SPEED,INPUT); attachInterrupt(digitalPinToInterrupt(cfg::PIN_SPEED),isrSpd,FALLING); }
     if(cfg::DEBUG_MODE) Serial.println("[SENSOR] Init OK");
     return true;
   }
 
+  void setProfile(const MotorProfile* profile) {
+    _profile = profile ? profile : getDefaultProfile();
+    _fuelAvgKmL = 0.0f;
+  }
   void setSimMode(bool v)   { _simMode=v; }
   void setEcuEnabled(bool v){ _ecuEnabled=v; }
   void setEcuOnline(bool v) { _ecuOnline=v; }
@@ -1097,10 +1348,11 @@ private:
   struct ExtFeed { float value=0; bool valid=false; uint32_t lastMs=0; SensorSource src=SensorSource::Ecu; };
 
   static volatile uint32_t s_rpmCnt, s_rpmEdge, s_spdCnt, s_spdEdge;
+  const MotorProfile* _profile;
   bool _simMode,_ecuEnabled,_ecuOnline;
   uint32_t _lastFastMs,_lastSlowMs,_lastSimMs,_lastDistMs,_lastRpmMs,_lastSpdMs;
   uint32_t _prevRpm,_prevSpd;
-  float _distM,_simPh;
+  float _distM,_simPh,_fuelAvgKmL;
   SensorSample _s[SENSOR_COUNT];
   HistoryWindow<float,8> _hist[SENSOR_COUNT];
   ExtFeed _ext[SENSOR_COUNT];
@@ -1121,7 +1373,9 @@ private:
     uint32_t dt=now-_lastSpdMs; _lastSpdMs=now;
     if((micros()-edge)>cfg::SPEED_TIMEOUT_US){ r.status=SensorStatus::Offline; r.value=_s[idx(SensorId::Speed)].lastGood; return r; }
     noInterrupts(); uint32_t d=cnt-_prevSpd; _prevSpd=cnt; interrupts();
-    float km=(dt>0)?((d/cfg::SPEED_PULSES_PER_REV*cfg::WHEEL_CIRCUMFERENCE_M)/(dt/1000.f)*3.6f*cfg::SPEED_CAL_FACTOR):0.f;
+    const float pulses = (_profile && _profile->speedPulsePerRev > 0.01f) ? _profile->speedPulsePerRev : cfg::SPEED_PULSES_PER_REV;
+    const float wheel = (_profile && _profile->wheelCircumferenceM > 0.1f) ? _profile->wheelCircumferenceM : cfg::WHEEL_CIRCUMFERENCE_M;
+    float km=(dt>0)?((d/pulses*wheel)/(dt/1000.f)*3.6f*cfg::SPEED_CAL_FACTOR):0.f;
     r.raw=d; r.value=clamp(km,0.f,220.f); r.valid=true; r.status=SensorStatus::Ok; return r;
   }
 
@@ -1132,7 +1386,8 @@ private:
     uint32_t dt=now-_lastRpmMs; _lastRpmMs=now;
     if((micros()-edge)>cfg::RPM_TIMEOUT_US){ r.status=SensorStatus::Offline; r.value=_s[idx(SensorId::Rpm)].lastGood; return r; }
     noInterrupts(); uint32_t d=cnt-_prevRpm; _prevRpm=cnt; interrupts();
-    float rpm=(dt>0)?((d/cfg::RPM_PULSES_PER_REV)*(60000.f/dt)*cfg::RPM_CAL_FACTOR):0.f;
+    const float pulses = (_profile && _profile->rpmPulsePerRev > 0.01f) ? _profile->rpmPulsePerRev : cfg::RPM_PULSES_PER_REV;
+    float rpm=(dt>0)?((d/pulses)*(60000.f/dt)*cfg::RPM_CAL_FACTOR):0.f;
     r.raw=d; r.value=clamp(rpm,0.f,14000.f); r.valid=true; r.status=SensorStatus::Ok; return r;
   }
 
@@ -1158,7 +1413,9 @@ private:
     float R=cfg::TEMP_NTC_FIXED_OHM*(v/(cfg::ADC_REF_VOLT-v));
     float iT=(1.f/298.15f)+(1.f/cfg::TEMP_NTC_BETA)*logf(R/cfg::TEMP_NTC_R25_OHM);
     float tc=clamp(1.f/iT-273.15f+cfg::TEMP_OFFSET_C,-20.f,160.f);
-    r.value=tc; r.valid=true; r.status=tc>105.f?SensorStatus::Warning:SensorStatus::Ok; return r;
+    const float warn = _profile ? _profile->temp.warningTemp : 105.0f;
+    const float danger = _profile ? _profile->temp.dangerTemp : 120.0f;
+    r.value=tc; r.valid=true; r.status=tc>danger?SensorStatus::Error:(tc>warn?SensorStatus::Warning:SensorStatus::Ok); return r;
   }
 
   ReadResult readBatt() {
@@ -1175,7 +1432,9 @@ private:
     ReadResult r; r.source=SensorSource::Hardware;
     if(cfg::PIN_FUEL_ADC<0) return r;
     uint16_t raw=AnalogSampler::averageRaw(cfg::PIN_FUEL_ADC,8);
-    float pct=clamp(mapf(raw,3800.f,400.f,0.f,100.f),0.f,100.f);
+    const float empty = _profile ? static_cast<float>(_profile->fuelAdcEmpty) : 3800.0f;
+    const float full = _profile ? static_cast<float>(_profile->fuelAdcFull) : 400.0f;
+    float pct=clamp(mapf(raw,empty,full,0.f,100.f),0.f,100.f);
     r.raw=raw; r.value=pct; r.valid=(raw>0&&raw<4095);
     r.status=r.valid?(pct<10.f?SensorStatus::Warning:SensorStatus::Ok):SensorStatus::Error; return r;
   }
@@ -1184,8 +1443,11 @@ private:
     ReadResult r; r.source=SensorSource::Hardware;
     if(cfg::PIN_TPS_ADC<0) return r;
     uint16_t raw=AnalogSampler::averageRaw(cfg::PIN_TPS_ADC);
-    float pct=clamp(mapf(raw,250.f,3800.f,0.f,100.f),0.f,100.f);
-    r.raw=raw; r.value=pct; r.valid=(raw>0&&raw<4095);
+    float v=AnalogSampler::toVolt(raw);
+    const float closed = _profile ? _profile->tpsVoltClosed : 0.50f;
+    const float open = _profile ? _profile->tpsVoltOpen : 4.50f;
+    float pct=clamp(mapf(v,closed,open,0.f,100.f),0.f,100.f);
+    r.raw=v; r.value=pct; r.valid=(raw>0&&raw<4095);
     r.status=r.valid?SensorStatus::Ok:SensorStatus::Error; return r;
   }
 
@@ -1291,6 +1553,7 @@ private:
 
   void buildSnap(uint32_t now){
     auto g=[&](SensorId id){return _s[idx(id)].filtered;};
+    const MotorProfile* profile = _profile ? _profile : getDefaultProfile();
     _snap.timestampMs=now;
     _snap.speedKmh    =g(SensorId::Speed);
     _snap.rpm         =static_cast<uint16_t>(roundf(g(SensorId::Rpm)));
@@ -1310,6 +1573,67 @@ private:
     _snap.dtcCode     =static_cast<uint16_t>(roundf(g(SensorId::DtcCode)));
     _snap.ecuEnabled  =_ecuEnabled; _snap.ecuOnline=_ecuOnline;
     _snap.engineRunning=_snap.rpm>300U;
+    _snap.tankCapacityL = profile->tankCapacityL;
+    _snap.motorModel = profile->model;
+    strncpy(_snap.motorName, profile->name, sizeof(_snap.motorName)-1);
+    _snap.motorName[sizeof(_snap.motorName)-1] = '\0';
+    updateFuelAndHealth(profile);
+    _snap.brand = profile->brandId;
+    _snap.mode = _ecuEnabled ? UiMode::Dashboard : UiMode::SensorMonitor;
+  }
+
+  void updateFuelAndHealth(const MotorProfile* profile) {
+    const float rpm = static_cast<float>(_snap.rpm);
+    const float pulseMs = _snap.injectorPulseMs;
+    const bool pulseFromEcu = _s[idx(SensorId::InjectorPulse)].source == SensorSource::Ecu;
+    _snap.fuelConsumptionEstimated = !pulseFromEcu;
+    if (_snap.engineRunning && rpm > 300.0f && pulseMs > 0.05f) {
+      const float duty = clamp((pulseMs * rpm) / 120000.0f, 0.0f, 0.95f);
+      const float fuelLph = (cfg::INJECTOR_FLOW_CC_MIN * duty) * 60.0f / 1000.0f;
+      if (fuelLph > 0.001f && _snap.speedKmh > 1.0f) {
+        _snap.fuelInstantKmL = clamp(_snap.speedKmh / fuelLph, 0.0f, 99.9f);
+        _fuelAvgKmL = (_fuelAvgKmL <= 0.01f) ? _snap.fuelInstantKmL : lpf(_fuelAvgKmL, _snap.fuelInstantKmL, 0.03f);
+      }
+      _snap.fuelLPer100Km = (_snap.fuelInstantKmL > 0.01f) ? (100.0f / _snap.fuelInstantKmL) : 0.0f;
+    }
+    _snap.fuelAverageKmL = _fuelAvgKmL;
+    const float usableFuelL = profile->tankCapacityL * clamp(_snap.fuelPercent, 0.0f, 100.0f) / 100.0f;
+    const float kmL = (_fuelAvgKmL > 0.01f) ? _fuelAvgKmL : _snap.fuelInstantKmL;
+    _snap.fuelRangeKm = usableFuelL * kmL;
+
+    const float tempScore = (_snap.engineTempC <= profile->temp.warningTemp) ? 100.0f :
+      (_snap.engineTempC >= profile->temp.dangerTemp ? 0.0f :
+       mapf(_snap.engineTempC, profile->temp.warningTemp, profile->temp.dangerTemp, 100.0f, 0.0f));
+    const float afrScore = (_snap.afr >= 13.0f && _snap.afr <= 15.5f) ? 100.0f :
+      clamp(100.0f - fabsf(_snap.afr - 14.7f) * 25.0f, 0.0f, 100.0f);
+    const float voltScore = (_snap.batteryVolt >= 12.0f && _snap.batteryVolt <= 15.0f) ? 100.0f :
+      clamp(100.0f - fabsf(_snap.batteryVolt - 13.6f) * 35.0f, 0.0f, 100.0f);
+    const float rpmScore = (_snap.rpm < 11500U) ? 100.0f : 35.0f;
+    const float fuelScore = _snap.fuelPercent > 10.0f ? 100.0f : clamp(_snap.fuelPercent * 10.0f, 0.0f, 100.0f);
+    _snap.engineHealth = clamp(tempScore * cfg::HEALTH_W_TEMP +
+                               afrScore * cfg::HEALTH_W_AFR +
+                               voltScore * cfg::HEALTH_W_VOLT +
+                               rpmScore * cfg::HEALTH_W_RPM +
+                               fuelScore * cfg::HEALTH_W_FUEL, 0.0f, 100.0f);
+    if (_snap.engineTempC >= profile->temp.dangerTemp) {
+      _snap.warningLevel = WarningLevel::Critical;
+      _snap.warningReason = WarningReason::Overheat;
+    } else if (_snap.engineTempC >= profile->temp.warningTemp) {
+      _snap.warningLevel = WarningLevel::Warning;
+      _snap.warningReason = WarningReason::Overheat;
+    } else if (_snap.batteryVolt > 0.1f && _snap.batteryVolt < 11.4f) {
+      _snap.warningLevel = WarningLevel::Warning;
+      _snap.warningReason = WarningReason::BatteryLow;
+    } else if (_snap.afr > 16.0f) {
+      _snap.warningLevel = WarningLevel::Warning;
+      _snap.warningReason = WarningReason::AfrLean;
+    } else if (_snap.afr < 12.5f) {
+      _snap.warningLevel = WarningLevel::Warning;
+      _snap.warningReason = WarningReason::AfrRich;
+    } else {
+      _snap.warningLevel = WarningLevel::None;
+      _snap.warningReason = WarningReason::None;
+    }
   }
 };
 
@@ -1318,16 +1642,16 @@ volatile uint32_t SensorHub::s_spdCnt=0, SensorHub::s_spdEdge=0;
 
 class ECURequestManager {
 public:
-  void begin(const BrandProfile* profile, bool enabled) {
+  void begin(const MotorProfile* profile, bool enabled) {
     _profile = profile; _enabled = enabled; _cursor = 0; _lastPollMs = 0;
     resetPollTimers();
   }
-  void setProfile(const BrandProfile* profile) { _profile = profile; _cursor = 0; resetPollTimers(); }
+  void setProfile(const MotorProfile* profile) { _profile = profile; _cursor = 0; resetPollTimers(); }
 
   void update(KLineManager& kline, SensorHub& hub) {
     if (!_enabled || !_profile || !kline.isConnected()) return;
     ECUFrame frame;
-    while (kline.pollFrame(frame)) ECUDataParser::parse(frame, hub, _profile->brandId);
+    while (kline.pollFrame(frame)) ECUDataParser::parse(frame, hub, *_profile);
     if (kline.waitingResponse()) return;
     const uint32_t now = millis();
     if ((now - _lastPollMs) < cfg::KLINE_POLL_MS) return;
@@ -1348,7 +1672,7 @@ public:
   void setEnabled(bool e) { _enabled = e; }
 
 private:
-  const BrandProfile* _profile   = nullptr;
+  const MotorProfile* _profile   = nullptr;
   bool     _enabled              = false;
   uint8_t  _cursor               = 0;
   uint32_t _lastPollMs           = 0;
@@ -1359,10 +1683,11 @@ private:
   }
 };
 
-void ECUDataParser::parse(const ECUFrame& frame, SensorHub& hub, BrandId brand) {
+void ECUDataParser::parse(const ECUFrame& frame, SensorHub& hub, const MotorProfile& profile) {
   if (!frame.valid || frame.payloadLen < 2) return;
   const uint8_t svc = frame.payload[0];
   const uint8_t pid = frame.payload[1];
+  const BrandId brand = profile.brandId;
   if (brand == BrandId::Honda || brand == BrandId::Kawasaki || brand == BrandId::GenericObd2) {
     if (svc < 0x40) return;
     switch (pid) {
@@ -1441,16 +1766,112 @@ KLineManager klineManager;
 ProtocolScanner scanner;
 SensorHub sensorHub;
 ECURequestManager requestManager;
+Preferences profilePrefs;
 
 bool scanStarted = false;
 bool scanProcessed = false;
+bool pendingRescan = false;
+uint32_t pendingRescanAtMs = 0;
+const MotorProfile* requestedScanProfile = nullptr;
 uint32_t lastPrintMs = 0;
 volatile bool scanButtonPressed = false;
+char serialLine[96] = {};
+uint8_t serialLineLen = 0;
 
 static inline bool pinActive(int16_t p) { return p >= 0; }
 
 void IRAM_ATTR handleScanButton() {
   scanButtonPressed = true;
+}
+
+void printActiveProfile() {
+  const MotorProfile* p = activeProfile ? activeProfile : getDefaultProfile();
+  Serial.println("----- ACTIVE MOTOR PROFILE -----");
+  Serial.printf("ID: %s\n", p->id);
+  Serial.printf("Name: %s\n", p->name);
+  Serial.printf("Protocol: %s | Checksum: %s | Init: %s\n",
+                protocolText(p->protocol), checksumText(p->checksumMode), initMethodText(p->initMethod));
+  Serial.printf("Tank: %.1f L | Wheel: %.3f m | RPM pulse/rev: %.2f | Speed pulse/rev: %.2f\n",
+                p->tankCapacityL, p->wheelCircumferenceM, p->rpmPulsePerRev, p->speedPulsePerRev);
+  Serial.printf("Fuel ADC empty/full: %u/%u | TPS closed/open: %.2f/%.2f V\n",
+                p->fuelAdcEmpty, p->fuelAdcFull, p->tpsVoltClosed, p->tpsVoltOpen);
+  Serial.printf("Temp normal %.0f-%.0f C | warning %.0f C | danger %.0f C\n",
+                p->temp.normalMin, p->temp.normalMax, p->temp.warningTemp, p->temp.dangerTemp);
+  Serial.printf("K-Line addr ECU=0x%02X tester=0x%02X header=0x%02X baud=%lu PID=%u\n",
+                p->ecuAddress, p->testerAddress, p->klineHeader, (unsigned long)p->baudRate, p->pidCount);
+  Serial.printf("ECU sensors: rpm=%s temp=%s tps=%s volt=%s dtc=%s\n",
+                p->supportsEcuRpm?"yes":"no", p->supportsEcuTemp?"yes":"no",
+                p->supportsEcuTps?"yes":"no", p->supportsEcuVoltage?"yes":"no",
+                p->supportsDtc?"yes":"no");
+  Serial.println("--------------------------------");
+}
+
+void printProfileList() {
+  Serial.println("----- MOTOR PROFILES -----");
+  for (size_t i = 0; i < USER_PROFILE_COUNT; ++i) {
+    const MotorProfile* p = USER_PROFILES[i];
+    Serial.printf("%s  -  %s  [%s]\n", p->id, p->name, protocolText(p->protocol));
+  }
+  Serial.println("--------------------------");
+}
+
+void applyMotorProfile(const MotorProfile* profile, const char* reason = "apply") {
+  if (!profile) profile = getDefaultProfile();
+  activeProfile = profile;
+  sensorHub.setProfile(profile);
+  klineManager.setProfile(profile);
+  requestManager.begin(profile, false);
+  sensorHub.setEcuEnabled(profile->protocol != ProtocolType::None);
+  sensorHub.setEcuOnline(false);
+  if (profile->protocol == ProtocolType::None) {
+    klineManager.enable(false);
+  }
+  Serial.printf("[PROFILE] %s: %s (%s)\n", reason, profile->name, profile->id);
+}
+
+ProfileDetectResult detectMotorProfile(const ScanResult& result) {
+  ProfileDetectResult out;
+  if (!result.detected) {
+    out.profile = getDefaultProfile();
+    out.confidence = 0;
+    out.confident = false;
+    return out;
+  }
+  out.profile = profileForScanResult(result);
+  out.confidence = result.confidence;
+  out.confident = out.profile && out.confidence >= 70;
+  if (!out.confident) {
+    out.profile = result.detected ? &PROFILE_GENERIC_KLINE : getDefaultProfile();
+  }
+  return out;
+}
+
+ProfileDetectResult detectMotorProfile() {
+  return detectMotorProfile(scanner.result());
+}
+
+void saveActiveProfile() {
+  const MotorProfile* p = activeProfile ? activeProfile : getDefaultProfile();
+  profilePrefs.putString("profile", p->id);
+  Serial.printf("[PROFILE] Saved manual profile: %s\n", p->id);
+}
+
+void clearSavedProfile() {
+  profilePrefs.remove("profile");
+  Serial.println("[PROFILE] Saved manual profile cleared");
+}
+
+const MotorProfile* loadSavedProfile() {
+  char savedId[32] = {};
+  size_t len = profilePrefs.getString("profile", savedId, sizeof(savedId));
+  if (len == 0) return nullptr;
+  const MotorProfile* p = findProfile(savedId);
+  if (!p) {
+    Serial.printf("[PROFILE] Saved profile '%s' not found, clearing\n", savedId);
+    clearSavedProfile();
+    return nullptr;
+  }
+  return p;
 }
 
 void printScanResult(const ScanResult& result) {
@@ -1460,10 +1881,12 @@ void printScanResult(const ScanResult& result) {
     return;
   }
   Serial.printf("Brand: %s\n", result.brandName);
+  Serial.printf("Profile ID: %s\n", result.profileId);
   Serial.printf("Protocol: %s\n", result.protoName);
   Serial.printf("Address: 0x%02X\n", result.ecuAddress);
   Serial.printf("Baud: %lu\n", (unsigned long)result.baudRate);
   Serial.printf("PID candidates: %u\n", result.pidsFound);
+  Serial.printf("Confidence: %u\n", result.confidence);
   Serial.printf("Scan time: %lums\n", (unsigned long)result.scanDurationMs);
   Serial.println("---------------------------");
 }
@@ -1473,29 +1896,53 @@ void printSnapshot(const DashboardSnapshot& snap) {
   Serial.printf("Time: %lums | ECU: %s | Online: %s\n", (unsigned long)snap.timestampMs,
                 snap.ecuEnabled?"ENABLED":"DISABLED",
                 snap.ecuOnline?"YES":"NO");
-  Serial.printf("Brand: %s | RPM: %u | Speed: %.1f km/h\n", brandText(snap.brand), snap.rpm, snap.speedKmh);
+  Serial.printf("Profile: %s | Brand: %s | RPM: %u | Speed: %.1f km/h\n",
+                snap.motorName, brandText(snap.brand), snap.rpm, snap.speedKmh);
   Serial.printf("AFR: %.2f | Temp: %.1f C | Batt: %.2f V\n", snap.afr, snap.engineTempC, snap.batteryVolt);
   Serial.printf("TPS: %.1f %% | MAP: %.1f kPa | IAT: %.1f C\n", snap.throttlePct, snap.mapKpa, snap.iatC);
-  Serial.printf("Fuel: %.1f %% | DTC: 0x%04X\n", snap.fuelPercent, snap.dtcCode);
+  Serial.printf("Fuel: %.1f %% / %.1f L | Range: %.1f km | Km/L: %.1f %s | Health: %.0f %% | DTC: 0x%04X\n",
+                snap.fuelPercent, snap.tankCapacityL, snap.fuelRangeKm,
+                snap.fuelAverageKmL > 0.01f ? snap.fuelAverageKmL : snap.fuelInstantKmL,
+                snap.fuelConsumptionEstimated ? "(est)" : "(ecu)", snap.engineHealth, snap.dtcCode);
   Serial.println("-------------------------------");
 }
 
-void triggerRescan() {
-  scanStarted = true;
+void triggerRescan(const MotorProfile* preferredProfile = nullptr) {
+  requestedScanProfile = preferredProfile;
+  pendingRescan = true;
+  pendingRescanAtMs = millis() + cfg::RESCAN_REINIT_DELAY_MS;
+  scanStarted = false;
   scanProcessed = false;
   requestManager.setEnabled(false);
   sensorHub.setEcuEnabled(false);
   sensorHub.setEcuOnline(false);
   klineManager.enable(false);
-  delay(50);
-  klineManager.reinit(cfg::PIN_KLINE_RX, cfg::PIN_KLINE_TX, cfg::KLINE_BAUD);
+  Serial.printf("[SYS] ECU rescan scheduled (%s)\n",
+                preferredProfile ? preferredProfile->id : "auto");
+}
+
+void servicePendingRescan() {
+  if (!pendingRescan || static_cast<int32_t>(millis() - pendingRescanAtMs) < 0) return;
+  pendingRescan = false;
+  const MotorProfile* profile = requestedScanProfile ? requestedScanProfile : activeProfile;
+  if (!profile) profile = getDefaultProfile();
+  const uint32_t baud = profile->baudRate ? profile->baudRate : cfg::KLINE_BAUD;
+  klineManager.setProfile(profile);
+  klineManager.reinit(cfg::PIN_KLINE_RX, cfg::PIN_KLINE_TX, baud);
   klineManager.enable(true);
-  scanner.begin(klineManager);
-  Serial.println("[SYS] ECU rescan started");
+  scanner.begin(klineManager, requestedScanProfile);
+  scanStarted = true;
+  scanProcessed = false;
+  Serial.printf("[SYS] ECU rescan started (%s)\n",
+                requestedScanProfile ? requestedScanProfile->id : "auto");
 }
 
 void autoReconnect() {
   static uint32_t lostSinceMs = 0;
+  if (!activeProfile || activeProfile->protocol == ProtocolType::None) {
+    lostSinceMs = 0;
+    return;
+  }
   const ScanResult result = scanner.result();
   if (!scanProcessed || !result.detected) {
     lostSinceMs = 0;
@@ -1510,55 +1957,141 @@ void autoReconnect() {
   if ((now - lostSinceMs) >= cfg::ECU_RECONNECT_DELAY_MS) {
     lostSinceMs = 0;
     Serial.println("[SYS] ECU offline, restarting scan");
-    triggerRescan();
+    triggerRescan(activeProfile && activeProfile->protocol != ProtocolType::None ? activeProfile : nullptr);
+  }
+}
+
+void processProfileCommand(char* line) {
+  if (strcmp(line, "profile list") == 0) {
+    printProfileList();
+    return;
+  }
+  if (strcmp(line, "profile show") == 0) {
+    printActiveProfile();
+    return;
+  }
+  if (strcmp(line, "profile auto") == 0) {
+    clearSavedProfile();
+    applyMotorProfile(getDefaultProfile(), "auto mode");
+    triggerRescan(nullptr);
+    return;
+  }
+  if (strncmp(line, "profile set ", 12) == 0) {
+    const char* id = line + 12;
+    const MotorProfile* p = findProfile(id);
+    if (!p) {
+      Serial.printf("[PROFILE] Unknown profile '%s'\n", id);
+      printProfileList();
+      return;
+    }
+    applyMotorProfile(p, "manual override");
+    if (p->protocol == ProtocolType::None) {
+      scanStarted = false;
+      scanProcessed = true;
+      pendingRescan = false;
+    } else {
+      triggerRescan(p);
+    }
+    return;
+  }
+  if (strcmp(line, "profile save") == 0) {
+    saveActiveProfile();
+    return;
+  }
+  if (strcmp(line, "profile clear") == 0) {
+    clearSavedProfile();
+    return;
+  }
+  Serial.println("[PROFILE] Commands: profile list | profile show | profile auto | profile set <id> | profile save | profile clear");
+}
+
+void serviceSerialCommands() {
+  while (Serial.available()) {
+    char c = static_cast<char>(Serial.read());
+    if (c == '\r') continue;
+    if (c == '\n') {
+      serialLine[serialLineLen] = '\0';
+      if (serialLineLen > 0) {
+        if (strncmp(serialLine, "profile", 7) == 0) processProfileCommand(serialLine);
+        else Serial.println("[SERIAL] Unknown command");
+      }
+      serialLineLen = 0;
+      return;
+    }
+    if (serialLineLen < sizeof(serialLine) - 1) {
+      serialLine[serialLineLen++] = c;
+    }
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(100);
   Serial.println("Universal ECU scanner starting...");
+  profilePrefs.begin("ecu-dash", false);
   if (!sensorHub.begin()) Serial.println("[ERROR] SensorHub init failed");
   if (pinActive(cfg::PIN_SCAN_BUTTON)) {
     pinMode(static_cast<uint8_t>(cfg::PIN_SCAN_BUTTON), INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(cfg::PIN_SCAN_BUTTON), handleScanButton, FALLING);
   }
   klineManager.begin(cfg::PIN_KLINE_RX, cfg::PIN_KLINE_TX, cfg::KLINE_BAUD);
-  klineManager.enable(true);
-  scanStarted = false;
-  scanProcessed = false;
+  const MotorProfile* saved = loadSavedProfile();
+  if (saved) {
+    applyMotorProfile(saved, "boot saved profile");
+    if (saved->protocol == ProtocolType::None) {
+      scanProcessed = true;
+    } else {
+      triggerRescan(saved);
+    }
+  } else {
+    applyMotorProfile(getDefaultProfile(), "boot default");
+    triggerRescan(nullptr);
+  }
+  printActiveProfile();
 }
 
 void loop() {
-  if (!scanStarted) {
-    scanner.begin(klineManager);
-    scanStarted = true;
-  }
+  serviceSerialCommands();
 
   if (scanButtonPressed) {
     scanButtonPressed = false;
     triggerRescan();
   }
 
+  servicePendingRescan();
   klineManager.update();
-  bool scanDone = scanner.isDone();
-  if (!scanDone) scanDone = scanner.update();
+  bool scanDone = scanStarted ? scanner.isDone() : scanProcessed;
+  if (scanStarted && !scanDone) scanDone = scanner.update();
 
   if (scanDone && !scanProcessed) {
     ScanResult result = scanner.result();
     printScanResult(result);
-    if (result.detected) {
-      requestManager.begin(profileForScanResult(result), true);
+    const MotorProfile* finalProfile = requestedScanProfile;
+    if (!finalProfile) {
+      ProfileDetectResult detected = detectMotorProfile(result);
+      finalProfile = detected.profile;
+      if (detected.confident) {
+        Serial.printf("[PROFILE] Auto detect confident: %s (%u)\n",
+                      getProfileName(finalProfile), detected.confidence);
+      } else {
+        Serial.printf("[PROFILE] Auto detect not confident (%u), fallback: %s\n",
+                      detected.confidence, getProfileName(finalProfile));
+      }
+    }
+    applyMotorProfile(finalProfile, requestedScanProfile ? "manual scan result" : "auto detect");
+    if (result.detected && finalProfile && finalProfile->protocol != ProtocolType::None) {
+      requestManager.begin(finalProfile, true);
       sensorHub.setEcuEnabled(true);
-      sensorHub.setEcuOnline(true);
+      sensorHub.setEcuOnline(klineManager.isConnected());
     } else {
+      requestManager.setEnabled(false);
       sensorHub.setEcuEnabled(false);
       sensorHub.setEcuOnline(false);
     }
     scanProcessed = true;
+    requestedScanProfile = nullptr;
   }
 
-  if (scanProcessed && scanner.result().detected) {
+  if (scanProcessed && activeProfile && activeProfile->protocol != ProtocolType::None && klineManager.isConnected()) {
     requestManager.update(klineManager, sensorHub);
   }
 
